@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Tres Formas · Entiende lo que lees",
+  "version": "1.2.0",
+  "description": "Reformula el texto seleccionado de tres maneras y, si eliges un idioma, muestra su traducción con IA.",
+  "minimum_chrome_version": "120",
+  "permissions": ["storage"],
+  "host_permissions": ["https://generativelanguage.googleapis.com/*", "https://api.groq.com/*", "https://openrouter.ai/*"],
+  "background": {"service_worker": "background.js", "type": "module"},
+  "action": {"default_popup": "popup.html", "default_title": "Tres Formas"},
+  "options_page": "options.html",
+  "icons": {"16": "icons/icon16.png", "48": "icons/icon48.png", "128": "icons/icon128.png"},
+  "content_scripts": [{"matches": ["http://*/*", "https://*/*"], "js": ["content.js"], "run_at": "document_idle", "all_frames": true}]
+}

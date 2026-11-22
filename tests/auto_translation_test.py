@@ -1,0 +1,223 @@
+"""Prueba de la extensión real con perfil temporal y APIs simuladas.
+
+Ejecutar: python tests/auto_translation_test.py
+Requiere Playwright y su navegador Chromium.
+"""
+import json
+import tempfile
+import time
+from pathlib import Path
+
+from playwright.sync_api import sync_playwright, expect
+
+
+ROOT = Path(__file__).resolve().parents[1]
+TEXT = "Este proyecto ayuda a comprender textos complicados mientras navegas por una página web."
+
+
+def check_until(check, message):
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if check():
+            return
+        time.sleep(0.05)
+    raise AssertionError(message)
+
+
+with sync_playwright() as p, tempfile.TemporaryDirectory(prefix="tres-formas-test-") as profile:
+    context = p.chromium.launch_persistent_context(
+        profile, channel="chromium", headless=True,
+        args=[f"--disable-extensions-except={ROOT}", f"--load-extension={ROOT}"],
+    )
+    try:
+        worker = context.service_workers[0] if context.service_workers else context.wait_for_event("serviceworker")
+        extension_id = worker.url.split("/")[2]
+        check_until(lambda: (worker.evaluate('() => true') and any(page.url.endswith('/options.html') for page in context.pages)),
+                    "No se completó la instalación de la extensión")
+        worker.evaluate("""() => {
+          globalThis.testRequests = [];
+          globalThis.testFailTranslation = false;
+          globalThis.fetch = async (url, options) => {
+            const body = JSON.parse(options.body);
+            const instruction = body.systemInstruction?.parts[0].text || body.messages[0].content;
+            testRequests.push({url:String(url), body, instruction});
+            const result = {versions:['Una versión sencilla del texto.', 'Una explicación directa del texto.', 'El texto dicho de forma cotidiana.']};
+            if (globalThis.testLiteralMarkup) result.versions[1] = '<em>Etiqueta de prueba</em>';
+            if (instruction.includes('"translation"') && !(testFailTranslation && String(url).includes('googleapis'))) {
+              result.translation = instruction.includes('ar-SA') ? 'نص مترجم' : 'Prevedeni tekst';
+            }
+            const content = JSON.stringify(result);
+            return new Response(JSON.stringify(body.systemInstruction
+              ? {candidates:[{content:{parts:[{text:content}]}}]}
+              : {choices:[{message:{content}}]}));
+          };
+        }""")
+        popup = context.new_page()
+        popup.goto(f"chrome-extension://{extension_id}/popup.html")
+        selector = popup.locator("#translation-language")
+        expect(selector).to_be_enabled()
+        expect(selector).to_have_value("")
+        codes = selector.locator("option").evaluate_all("options => options.map(o => o.value)")
+        assert codes[:6] == ["", "en-GB", "ar-SA", "sr-RS", "de-DE", "zh-CN"]
+        assert len(codes) == len(set(codes)) == 151
+        worker.evaluate("() => chrome.storage.local.set({enabled:true, freeConfirmed:true, keys:{gemini:'test-key',groq:'test-key'}})")
+        assert popup.locator('#usage').count() == 0
+        assert 'MyMemory' not in popup.inner_text('body')
+
+        page = context.new_page()
+        def fixture(route):
+            if route.request.url.endswith('/privacidad'):
+                body = '<p>Antes</p><div id="editor" contenteditable="true">Borrador de prueba</div><p>Después</p><input type="password" value="dato-ficticio">'
+            else:
+                body = f'<p id="sample">{TEXT}</p>'
+            route.fulfill(content_type="text/html; charset=utf-8",
+                          body=f'<html lang="es"><head><title>Título privado de prueba</title></head><body>{body}</body></html>')
+        context.route("https://tres-formas.test/**", fixture)
+        cdp = context.new_cdp_session(page)
+
+        def nodes():
+            tree = cdp.send("DOM.getDocument", {"depth": -1, "pierce": True})["root"]
+            result = []
+
+            def visit(node):
+                result.append(node)
+                for child in node.get("children", []) + node.get("shadowRoots", []):
+                    visit(child)
+            visit(tree)
+            return result
+
+        def panel_text():
+            return " ".join(node.get("nodeValue", "") for node in nodes())
+
+        def select_text():
+            page.goto("https://tres-formas.test/")
+            # GET_STATE se resuelve antes de que el usuario seleccione texto.
+            page.wait_for_timeout(200)
+            page.locator('#sample').click(click_count=3)
+            check_until(lambda: "Una versión sencilla del texto." in panel_text(), "Faltan las reformulaciones")
+
+        def translations():
+            return worker.evaluate("() => testRequests.filter(request => request.instruction.includes('\"translation\"'))")
+
+        select_text()
+        assert translations() == [], "Sin idioma no debe haber traducción automática"
+        assert "Prevedeni tekst" not in panel_text()
+        assert not any(node['nodeName'] == 'SELECT' for node in nodes())
+        print("OK: predeterminado vacío y ninguna llamada automática")
+
+        selector.select_option("sr-RS")
+        expect(popup.locator("#language-status")).to_contain_text("Idioma guardado")
+        popup.reload()
+        expect(selector).to_have_value("sr-RS")
+        select_text()
+        check_until(lambda: "Prevedeni tekst" in panel_text(), "No aparece la traducción serbia")
+        text = panel_text()
+        assert text.index("El texto dicho de forma cotidiana.") < text.index("Prevedeni tekst")
+        assert 'sr-RS' in translations()[-1]['instruction']
+        assert json.loads(translations()[-1]['body']['contents'][0]['parts'][0]['text'])['text'] == TEXT
+        assert len(translations()) == 1, 'La traducción debe venir en la misma consulta'
+        print("OK: persistencia, tres versiones y traducción del original debajo")
+
+        selector.select_option("ar-SA")
+        expect(popup.locator("#language-status")).to_contain_text("Idioma guardado")
+        select_text()
+        check_until(lambda: "نص مترجم" in panel_text(), "No aparece la traducción árabe")
+        assert any(node.get('attributes', []) == ['lang', 'ar-SA', 'dir', 'rtl'] for node in nodes())
+        print("OK: traducción árabe de derecha a izquierda")
+
+        worker.evaluate("() => { testFailTranslation = true; }")
+        select_text()
+        check_until(lambda: 'نص مترجم' in panel_text(), 'Falta la traducción del proveedor de respaldo')
+        assert 'groq.com' in translations()[-1]['url']
+        print("OK: una traducción incompleta activa el proveedor de respaldo")
+
+        selector.select_option("")
+        expect(popup.locator("#language-status")).to_contain_text("desactivada")
+        before = len(translations())
+        select_text()
+        assert len(translations()) == before
+        assert not any(node['nodeName'] == 'SELECT' for node in nodes())
+        assert 'MyMemory' not in panel_text()
+        assert all('mymemory' not in request['url'].lower() for request in worker.evaluate('() => testRequests'))
+        print("OK: volver a ningún idioma desactiva las traducciones automáticas")
+
+        worker.evaluate('() => { globalThis.testLiteralMarkup = true; }')
+        select_text()
+        assert '<em>Etiqueta de prueba</em>' in panel_text()
+        assert not any(node['nodeName'] == 'EM' for node in nodes())
+        requests = worker.evaluate('() => testRequests')
+        for request in requests:
+            body = request['body']
+            content = body['contents'][0]['parts'][0]['text'] if 'contents' in body else body['messages'][-1]['content']
+            assert json.loads(content) == {'text': TEXT}
+            assert all(marker not in json.dumps(body) for marker in ['tres-formas.test', 'test-key', 'privado de prueba'])
+        print('OK: texto de IA literal y peticiones sin URL, título ni claves en el cuerpo')
+
+        page.goto('https://tres-formas.test/privacidad')
+        page.wait_for_timeout(200)
+        page.locator('#editor').click(click_count=3)
+        page.wait_for_timeout(650)
+        assert len(worker.evaluate('() => testRequests')) == len(requests)
+        page.locator('input').press('Control+a')
+        page.wait_for_timeout(650)
+        assert len(worker.evaluate('() => testRequests')) == len(requests)
+        page.get_by_text('Antes', exact=True).click()
+        page.keyboard.press('Control+a')
+        assert 'Borrador de prueba' in page.evaluate('getSelection().toString()')
+        page.wait_for_timeout(650)
+        assert len(worker.evaluate('() => testRequests')) == len(requests)
+        print('OK: sin peticiones desde contraseña, editor ni selección que cruce el editor')
+
+        # Un contexto de contenido debe carecer de acceso incluso a un ajuste inocuo.
+        worlds = []
+        cdp.on('Runtime.executionContextCreated', lambda event: worlds.append(event['context']))
+        cdp.send('Runtime.enable')
+        isolated = next(world for world in worlds if world['origin'] == f'chrome-extension://{extension_id}')
+        def in_content(expression):
+            reply = cdp.send('Runtime.evaluate', {'contextId': isolated['id'], 'expression': expression,
+                                                  'awaitPromise': True, 'returnByValue': True})
+            assert 'exceptionDetails' not in reply, reply.get('exceptionDetails')
+            return reply['result'].get('value')
+        assert in_content('''(async () => {
+          try { await chrome.storage.local.get('enabled'); return false; } catch { return true; }
+        })()''')
+        state = in_content("chrome.runtime.sendMessage({type:'GET_STATE'})")
+        assert state['enabled'] and set(state) == {'enabled', 'configured', 'translationLanguage'}
+        assert 'error' in in_content("chrome.runtime.sendMessage({type:'RESET_COOLDOWNS'})")
+        assert worker.evaluate('''async text => {
+          const data = await chrome.storage.local.get(null);
+          return !JSON.stringify(data).includes(text) && !JSON.stringify(data).includes('Etiqueta de prueba');
+        }''', TEXT)
+        print('OK: almacén local restringido, estado sin claves y acción de ajustes denegada al script de página')
+
+        popup.locator('#toggle').click()
+        expect(popup.locator('#toggle')).to_have_attribute('aria-checked', 'false')
+        page.goto('https://tres-formas.test/')
+        page.wait_for_timeout(200)
+        page.locator('#sample').click(click_count=3)
+        page.wait_for_timeout(650)
+        assert len(worker.evaluate('() => testRequests')) == len(requests)
+        assert 'Etiqueta de prueba' not in panel_text()
+        popup.locator('#toggle').click()
+        expect(popup.locator('#toggle')).to_have_attribute('aria-checked', 'true')
+        select_text()
+        print('OK: apagar la extensión impide enviar selecciones')
+        popup.screenshot(path=str(Path(tempfile.gettempdir()) / "tres-formas-popup.png"))
+        exceptions = []
+        cdp.send('Runtime.enable')
+        cdp.on('Runtime.exceptionThrown', lambda event: exceptions.append(event))
+        page.on('pageerror', lambda error: exceptions.append(str(error)))
+        worker.evaluate('() => { setTimeout(() => chrome.runtime.reload(), 0); }')
+        page.wait_for_timeout(500)
+        page.keyboard.press('Escape')
+        page.evaluate("""() => {
+          window.dispatchEvent(new Event('pagehide'));
+          document.querySelector('#sample').dispatchEvent(new PointerEvent('pointerup', {bubbles:true}));
+          window.dispatchEvent(new Event('pagehide'));
+        }""")
+        page.wait_for_timeout(600)
+        assert exceptions == [], f'Errores tras recargar la extensión: {exceptions}'
+        assert 'Una versión sencilla del texto.' not in panel_text()
+        print('OK: recargar la extensión con una pestaña abierta no deja errores sin capturar')
+    finally:
+        context.close()
