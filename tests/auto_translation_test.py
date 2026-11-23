@@ -68,6 +68,18 @@ with sync_playwright() as p, tempfile.TemporaryDirectory(prefix="tres-formas-tes
         def fixture(route):
             if route.request.url.endswith('/privacidad'):
                 body = '<p>Antes</p><div id="editor" contenteditable="true">Borrador de prueba</div><p>Después</p><input type="password" value="dato-ficticio">'
+            elif route.request.url.endswith('/parrafos'):
+                body = '<p id="start">Primer párrafo de la selección.</p><p>Segundo párrafo con <strong>varios elementos</strong>.</p><p id="end">Final del texto seleccionado.</p>'
+            elif route.request.url.endswith('/cuestionario'):
+                body = '''<form>
+                  <p id="start">Una pregunta con varias opciones para reformular.</p>
+                  <input type="hidden" value="dato-oculto-no-enviar">
+                  <p><input id="radio" type="radio" name="opcion" value="valor-radio-no-enviar"><label for="radio">Primera opción</label></p>
+                  <p><input type="RADIO" name="opcion"><span>Segunda opción</span></p>
+                  <p><input id="checkbox" type="checkbox" value="valor-checkbox-no-enviar"><label for="checkbox">Otra opción</label></p>
+                  <input type="button" value="Botón"><input type="submit" value="Enviar"><input type="reset" value="Restablecer">
+                  <p id="end">Final del texto seleccionado.</p>
+                </form>'''
             else:
                 body = f'<p id="sample">{TEXT}</p>'
             route.fulfill(content_type="text/html; charset=utf-8",
@@ -152,6 +164,52 @@ with sync_playwright() as p, tempfile.TemporaryDirectory(prefix="tres-formas-tes
             assert json.loads(content) == {'text': TEXT}
             assert all(marker not in json.dumps(body) for marker in ['tres-formas.test', 'test-key', 'privado de prueba'])
         print('OK: texto de IA literal y peticiones sin URL, título ni claves en el cuerpo')
+
+        # Regresión: una selección entre bloques puede atravesar controles de un formulario.
+        for path, gesture in [('parrafos', 'mouse'), ('cuestionario', 'mouse'),
+                              ('cuestionario', 'reverse'), ('cuestionario', 'radio'),
+                              ('cuestionario', 'checkbox')]:
+            page.goto(f'https://tres-formas.test/{path}')
+            page.wait_for_timeout(200)
+            before = len(worker.evaluate('() => testRequests'))
+            if gesture in ('radio', 'checkbox'):
+                page.locator(f'#{gesture}').focus()
+                page.keyboard.press('Control+a')
+            else:
+                points = page.evaluate('''() => {
+                  const first = document.querySelector('#start').firstChild;
+                  const last = document.querySelector('#end').firstChild;
+                  const range = document.createRange();
+                  range.setStart(first, 0); range.setEnd(first, 1);
+                  const start = range.getBoundingClientRect();
+                  range.setStart(last, last.length - 1); range.setEnd(last, last.length);
+                  const end = range.getBoundingClientRect();
+                  return [[start.left, start.top + start.height / 2], [end.right, end.top + end.height / 2]];
+                }''')
+                if gesture == 'reverse':
+                    points.reverse()
+                page.mouse.move(*points[0])
+                page.mouse.down()
+                page.mouse.move(*points[1], steps=12)
+                page.mouse.up()
+            selected = page.evaluate('getSelection().toString().trim()')
+            assert 'Final del texto seleccionado.' in selected
+            if path == 'cuestionario':
+                assert all(text in selected for text in ['Una pregunta', 'Primera opción', 'Segunda opción', 'Otra opción'])
+            else:
+                assert 'Primer párrafo' in selected and 'Segundo párrafo' in selected
+            check_until(lambda: len(worker.evaluate('() => testRequests')) > before,
+                        f'No se procesó la selección: {path}/{gesture}')
+            check_until(lambda: 'Una versión sencilla del texto.' in panel_text(), 'Falta el panel de resultados')
+            sent = worker.evaluate('''() => {
+              const body = testRequests.at(-1).body;
+              return JSON.parse(body.contents?.[0].parts[0].text || body.messages.at(-1).content).text;
+            }''')
+            assert sent == selected, 'Se debe enviar todo el texto seleccionado'
+            assert 'no-enviar' not in sent, 'No se deben extraer valores de controles'
+            assert len(worker.evaluate('() => testRequests')) == before + 1
+            print(f'OK: selección completa {path}/{gesture}')
+        requests = worker.evaluate('() => testRequests')
 
         page.goto('https://tres-formas.test/privacidad')
         page.wait_for_timeout(200)

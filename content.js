@@ -138,7 +138,12 @@
       footer.firstChild.textContent = `Respuesta de ${result.provider}`;
     } catch { if (id === serial && host) error('Se ha perdido la conexión con la extensión. Recarga esta pestaña y vuelve a intentarlo.', false); }
   }
-  const editable = 'input,textarea,select,[contenteditable]:not([contenteditable="false" i]),[role="textbox" i]';
+  // Una selección entre párrafos puede cruzar radios, casillas o campos ocultos.
+  // Estos controles no aportan texto editable a la selección del documento.
+  const editable = [
+    'input:not([type="radio" i], [type="checkbox" i], [type="hidden" i], [type="button" i], [type="submit" i], [type="reset" i], [type="image" i])',
+    'textarea', 'select', '[contenteditable]:not([contenteditable="false" i])', '[role="textbox" i]'
+  ].join(',');
   function includesEditable(range, event) {
     if (document.designMode === 'on' || document.activeElement?.closest(editable)) return true;
     if (event.composedPath().some(item => item instanceof Element && item.matches(editable))) return true;
@@ -150,8 +155,8 @@
   }
   function capture(event) {
     if (!enabled || !event.isTrusted || (host && event.composedPath().includes(host))) return;
-    clearTimeout(timer);
     if (event.type === 'keyup' && !['Shift','ArrowLeft','ArrowRight','ArrowUp','ArrowDown','a','A'].includes(event.key)) return;
+    clearTimeout(timer);
     const selection = window.getSelection();
     if (!selection || selection.isCollapsed || selection.rangeCount !== 1) return;
     const range = selection.getRangeAt(0);
