@@ -61,7 +61,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     jobs.set(jobId, job);
     try {
       const {cooldowns = {}} = await chrome.storage.session.get('cooldowns');
-      const result = await reformulate({keys, text, cooldowns, signal: job.signal, translationLanguage: LANGUAGES.find(item => item.code === translationLanguage) || null, onFailure: async (id, state) => {
+      const result = await reformulate({keys, text, cooldowns, signal: job.signal,
+        detectLanguage: text => chrome.i18n.detectLanguage(text),
+        translationLanguage: LANGUAGES.find(item => item.code === translationLanguage) || null, onFailure: async (id, state) => {
         const current = await chrome.storage.session.get('cooldowns');
         await chrome.storage.session.set({cooldowns: {...current.cooldowns, [id]: state}});
       }});
